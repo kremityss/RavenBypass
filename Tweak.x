@@ -1,4 +1,4 @@
-// RavenBypass — ANOGS/ACE bypass for CODM
+// RavenShield — ANOGS/ACE bypass for CODM
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -12,7 +12,7 @@
 #import <errno.h>
 #import "fishhook.h"
 
-// Only sysctl/ptrace declared manually — SDK headers for these conflict with Foundation
+// Manual declarations — SDK headers for sysctl/ptrace conflict with Foundation
 extern int sysctl(int *, unsigned int, void *, size_t *, void *, size_t);
 extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 extern int ptrace(int, int, void *, int);
@@ -302,13 +302,13 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 // 7. NSBundle swizzles
 // ─────────────────────────────────────────────────────────────────────
 
-@interface NSBundle (RavenBypass)
+@interface NSBundle (RavenShield)
 - (NSString *)raven_bundleIdentifier;
 - (id)raven_objectForInfoDictionaryKey:(NSString *)key;
 - (NSDictionary *)raven_infoDictionary;
 @end
 
-@implementation NSBundle (RavenBypass)
+@implementation NSBundle (RavenShield)
 
 - (NSString *)raven_bundleIdentifier {
     if (self == [NSBundle mainBundle]) return @(kBundleID);
@@ -354,7 +354,7 @@ static void installNSBundleSwizzles(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Rebind table (global so the add-image callback can reach it)
+// Rebind table
 // ─────────────────────────────────────────────────────────────────────
 
 static struct rebinding gRebinds[] = {
@@ -390,14 +390,14 @@ static void raven_add_image(const struct mach_header *mh, intptr_t slide) {
 
 __attribute__((constructor(101)))
 static void raven_init(void) {
-    NSLog(@"[RavenBypass] installing ANOGS/ACE bypass");
+    NSLog(@"[RavenShield] installing ANOGS/ACE bypass");
 
     int ret = rebind_symbols(gRebinds, gRebindCount);
-    NSLog(@"[RavenBypass] rebind_symbols returned %d", ret);
+    NSLog(@"[RavenShield] rebind_symbols returned %d", ret);
 
     installNSBundleSwizzles();
 
     _dyld_register_func_for_add_image(raven_add_image);
 
-    NSLog(@"[RavenBypass] bypass active");
+    NSLog(@"[RavenShield] bypass active");
 }
