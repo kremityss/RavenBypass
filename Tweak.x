@@ -1,40 +1,24 @@
 // RavenBypass — ANOGS/ACE bypass for CODM
-// Reconstructed from the recovered Cloud bypass logic.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach-o/getsect.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <string.h>
 #import <errno.h>
 #import "fishhook.h"
 
-// ─────────────────────────────────────────────────────────────────────
-// Manual declarations — avoids <sys/sysctl.h>, <sys/ptrace.h>,
-// <mach-o/getsect.h>, and mismatched Security headers on newer SDKs.
-// ─────────────────────────────────────────────────────────────────────
-
+// Only sysctl/ptrace declared manually — SDK headers for these conflict with Foundation
 extern int sysctl(int *, unsigned int, void *, size_t *, void *, size_t);
 extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 extern int ptrace(int, int, void *, int);
 
-extern struct segment_command_64 *getsegbyname(const char *segname);
-extern void *getsegmentdata(const struct mach_header *mh,
-                            const char *segname,
-                            unsigned long *size);
-
-extern CFTypeRef SecTaskCopyValueForEntitlement(void *task,
-                                                CFStringRef entitlement,
-                                                CFErrorRef *error);
-extern OSStatus SecCodeCheckValidity(void *code, uint32_t flags, void *errors);
-extern OSStatus SecStaticCodeCheckValidity(void *code, uint32_t flags, void *errors);
-extern CFStringRef SecCertificateCopySubjectSummary(void *certificate);
-
 // ─────────────────────────────────────────────────────────────────────
-// Identity constants — make the game look like the official build
+// Identity constants
 // ─────────────────────────────────────────────────────────────────────
 
 static const char *kBundleID      = "com.activision.callofduty.shooter";
@@ -146,12 +130,9 @@ static int hook_dladdr(const void *addr, struct dl_info_s *info) {
 
 #define FAKE_LINKEDIT_SIZE 0x7ED160ULL
 
-typedef struct segment_command_64 *(*getsegbyname_fn)(const char *);
-typedef void *(*getsegmentdata_fn)(const struct mach_header *,
-                                    const char *, unsigned long *);
-
-static getsegbyname_fn orig_getsegbyname;
-static getsegmentdata_fn orig_getsegmentdata;
+static struct segment_command_64 *(*orig_getsegbyname)(const char *);
+static void *(*orig_getsegmentdata)(const struct mach_header *,
+                                     const char *, unsigned long *);
 
 static struct segment_command_64 *hook_getsegbyname(const char *seg) {
     if (!orig_getsegbyname) return NULL;
@@ -181,7 +162,7 @@ static void *hook_getsegmentdata(const struct mach_header *mh,
 typedef CFTypeRef (*SecTaskCopyValueForEntitlement_fn)(void *, CFStringRef, CFErrorRef *);
 typedef OSStatus (*SecCodeCheckValidity_fn)(void *, uint32_t, void *);
 typedef OSStatus (*SecStaticCodeCheckValidity_fn)(void *, uint32_t, void *);
-typedef CFStringRef (*SecCertificateCopySubjectSummary_fn)(void *);
+typedef CFStringRef (*SecCertificateCopySubjectSummary_fn)(SecCertificateRef);
 
 static SecTaskCopyValueForEntitlement_fn orig_SecTaskCopyValueForEntitlement;
 static SecCodeCheckValidity_fn orig_SecCodeCheckValidity;
@@ -242,7 +223,7 @@ static OSStatus hook_SecStaticCodeCheckValidity(void *code, uint32_t flags, void
     return errSecSuccess;
 }
 
-static CFStringRef hook_SecCertSubjSummary(void *cert) {
+static CFStringRef hook_SecCertSubjSummary(SecCertificateRef cert) {
     return cfstr(kCertSubject);
 }
 
@@ -298,7 +279,6 @@ static char *hook_getenv(const char *name) {
 // ─────────────────────────────────────────────────────────────────────
 
 #define ANO_BLOCKED_MASK 0x0002C6000E040002ULL
-// Bits: 1, 18, 25, 26, 27, 41, 42, 46, 47, 49
 
 typedef uintptr_t (*AnoSDKIoctl_fn)(uint32_t, uintptr_t, void *, size_t);
 static AnoSDKIoctl_fn orig_AnoSDKIoctl;
@@ -319,7 +299,7 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 7. NSBundle identity swizzle
+// 7. NSBundle swizzles
 // ─────────────────────────────────────────────────────────────────────
 
 @interface NSBundle (RavenBypass)
@@ -374,6 +354,37 @@ static void installNSBundleSwizzles(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Rebind table (global so the add-image callback can reach it)
+// ─────────────────────────────────────────────────────────────────────
+
+static struct rebinding gRebinds[] = {
+    { "_dyld_image_count",              (void *)hook_dyld_image_count,              (void **)&orig_dyld_image_count },
+    { "_dyld_get_image_name",           (void *)hook_dyld_get_image_name,           (void **)&orig_dyld_get_image_name },
+    { "_dyld_get_image_header",         (void *)hook_dyld_get_image_header,         (void **)&orig_dyld_get_image_header },
+    { "_dyld_get_image_vmaddr_slide",   (void *)hook_dyld_get_image_vmaddr_slide,   (void **)&orig_dyld_get_image_vmaddr_slide },
+    { "dladdr",                         (void *)hook_dladdr,                        (void **)&orig_dladdr },
+    { "getsegbyname",                   (void *)hook_getsegbyname,                  (void **)&orig_getsegbyname },
+    { "getsegmentdata",                 (void *)hook_getsegmentdata,                (void **)&orig_getsegmentdata },
+    { "SecTaskCopyValueForEntitlement", (void *)hook_SecTaskCopyValueForEntitlement,(void **)&orig_SecTaskCopyValueForEntitlement },
+    { "SecCodeCheckValidity",           (void *)hook_SecCodeCheckValidity,          (void **)&orig_SecCodeCheckValidity },
+    { "SecStaticCodeCheckValidity",     (void *)hook_SecStaticCodeCheckValidity,    (void **)&orig_SecStaticCodeCheckValidity },
+    { "SecCertificateCopySubjectSummary",(void *)hook_SecCertSubjSummary,           (void **)&orig_SecCertSubjSummary },
+    { "sysctl",                         (void *)hook_sysctl,                        (void **)&orig_sysctl },
+    { "sysctlbyname",                   (void *)hook_sysctlbyname,                  (void **)&orig_sysctlbyname },
+    { "ptrace",                         (void *)hook_ptrace,                        (void **)&orig_ptrace },
+    { "getenv",                         (void *)hook_getenv,                        (void **)&orig_getenv },
+    { "AnoSDKIoctl",                    (void *)hook_AnoSDKIoctl,                   (void **)&orig_AnoSDKIoctl },
+};
+static const int gRebindCount = sizeof(gRebinds) / sizeof(gRebinds[0]);
+
+// Plain C function — required because _dyld_register_func_for_add_image
+// takes a function pointer, not a block.
+static void raven_add_image(const struct mach_header *mh, intptr_t slide) {
+    (void)mh; (void)slide;
+    rebind_symbols(gRebinds, gRebindCount);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────────────────────────────
 
@@ -381,34 +392,12 @@ __attribute__((constructor(101)))
 static void raven_init(void) {
     NSLog(@"[RavenBypass] installing ANOGS/ACE bypass");
 
-    static struct rebinding rb[] = {
-        { "_dyld_image_count",              (void *)hook_dyld_image_count,              (void **)&orig_dyld_image_count },
-        { "_dyld_get_image_name",           (void *)hook_dyld_get_image_name,           (void **)&orig_dyld_get_image_name },
-        { "_dyld_get_image_header",         (void *)hook_dyld_get_image_header,         (void **)&orig_dyld_get_image_header },
-        { "_dyld_get_image_vmaddr_slide",   (void *)hook_dyld_get_image_vmaddr_slide,   (void **)&orig_dyld_get_image_vmaddr_slide },
-        { "dladdr",                         (void *)hook_dladdr,                        (void **)&orig_dladdr },
-        { "getsegbyname",                   (void *)hook_getsegbyname,                  (void **)&orig_getsegbyname },
-        { "getsegmentdata",                 (void *)hook_getsegmentdata,                (void **)&orig_getsegmentdata },
-        { "SecTaskCopyValueForEntitlement", (void *)hook_SecTaskCopyValueForEntitlement,(void **)&orig_SecTaskCopyValueForEntitlement },
-        { "SecCodeCheckValidity",           (void *)hook_SecCodeCheckValidity,          (void **)&orig_SecCodeCheckValidity },
-        { "SecStaticCodeCheckValidity",     (void *)hook_SecStaticCodeCheckValidity,    (void **)&orig_SecStaticCodeCheckValidity },
-        { "SecCertificateCopySubjectSummary",(void *)hook_SecCertSubjSummary,           (void **)&orig_SecCertSubjSummary },
-        { "sysctl",                         (void *)hook_sysctl,                        (void **)&orig_sysctl },
-        { "sysctlbyname",                   (void *)hook_sysctlbyname,                  (void **)&orig_sysctlbyname },
-        { "ptrace",                         (void *)hook_ptrace,                        (void **)&orig_ptrace },
-        { "getenv",                         (void *)hook_getenv,                        (void **)&orig_getenv },
-        { "AnoSDKIoctl",                    (void *)hook_AnoSDKIoctl,                   (void **)&orig_AnoSDKIoctl },
-    };
-    int n = sizeof(rb) / sizeof(rb[0]);
-    int ret = rebind_symbols(rb, n);
+    int ret = rebind_symbols(gRebinds, gRebindCount);
     NSLog(@"[RavenBypass] rebind_symbols returned %d", ret);
 
     installNSBundleSwizzles();
 
-    _dyld_register_func_for_add_image(^(const struct mach_header *mh,
-                                         intptr_t slide) {
-        rebind_symbols(rb, n);
-    });
+    _dyld_register_func_for_add_image(raven_add_image);
 
     NSLog(@"[RavenBypass] bypass active");
 }
