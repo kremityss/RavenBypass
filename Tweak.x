@@ -13,14 +13,9 @@
 #import <stdatomic.h>
 #import "fishhook.h"
 
-// Manual declarations — SDK headers for sysctl/ptrace conflict with Foundation
 extern int sysctl(int *, unsigned int, void *, size_t *, void *, size_t);
 extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 extern int ptrace(int, int, void *, int);
-
-// ─────────────────────────────────────────────────────────────────────
-// Identity constants
-// ─────────────────────────────────────────────────────────────────────
 
 static const char *kBundleID      = "com.activision.callofduty.shooter";
 static const char *kTeamID        = "6KZFBJ4CBY";
@@ -31,11 +26,8 @@ static const char *kAppGroup      = "group.com.activision.callofduty.shooter";
 static const char *kCertSubject   = "Apple Distribution: Activision Publishing, Inc. (6KZFBJ4CBY)";
 static const char *kAnoVersion    = "7.7.58.42114";
 
-// ─────────────────────────────────────────────────────────────────────
-// Cached mainBundle — used by NSBundle swizzles to avoid re-entrancy
-// ─────────────────────────────────────────────────────────────────────
-
 static NSBundle *gMainBundle = nil;
+static _Atomic BOOL gDidInit = NO;
 
 // ─────────────────────────────────────────────────────────────────────
 // Hidden-image classifier
@@ -71,7 +63,9 @@ static uint32_t filtered_to_real(uint32_t filtered) {
     uint32_t n = orig_dyld_image_count();
     uint32_t visible = 0;
     for (uint32_t real = 0; real < n; real++) {
-        if (shouldHideImage(orig_dyld_get_image_name(real))) continue;
+        const char *nm = orig_dyld_get_image_name(real);
+        if (!nm) continue;
+        if (shouldHideImage(nm)) continue;
         if (visible == filtered) return real;
         visible++;
     }
@@ -84,7 +78,8 @@ static uint32_t hook_dyld_image_count(void) {
     if (!orig_dyld_get_image_name) return n;
     uint32_t hidden = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (shouldHideImage(orig_dyld_get_image_name(i))) hidden++;
+        const char *nm = orig_dyld_get_image_name(i);
+        if (nm && shouldHideImage(nm)) hidden++;
     }
     return n - hidden;
 }
@@ -204,18 +199,12 @@ static CFTypeRef hook_SecTaskCopyValueForEntitlement(void *task,
     cfStringToC(key, k, sizeof(k));
 
     if (k[0]) {
-        if (strcmp(k, "application-identifier") == 0)
-            return cfstr(kAppID);
-        if (strcmp(k, "com.apple.developer.team-identifier") == 0)
-            return cfstr(kTeamID);
-        if (strcmp(k, "aps-environment") == 0)
-            return cfstr("production");
-        if (strcmp(k, "keychain-access-groups") == 0)
-            return arr2(kAppID, kKeychainWild);
-        if (strcmp(k, "com.apple.security.application-groups") == 0)
-            return arr1(kAppGroup);
-        if (strcmp(k, "get-task-allow") == 0)
-            return kCFBooleanFalse;
+        if (strcmp(k, "application-identifier") == 0) return cfstr(kAppID);
+        if (strcmp(k, "com.apple.developer.team-identifier") == 0) return cfstr(kTeamID);
+        if (strcmp(k, "aps-environment") == 0) return cfstr("production");
+        if (strcmp(k, "keychain-access-groups") == 0) return arr2(kAppID, kKeychainWild);
+        if (strcmp(k, "com.apple.security.application-groups") == 0) return arr1(kAppGroup);
+        if (strcmp(k, "get-task-allow") == 0) return kCFBooleanFalse;
     }
     if (orig_SecTaskCopyValueForEntitlement)
         return orig_SecTaskCopyValueForEntitlement(task, key, err);
@@ -270,7 +259,7 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 }
 
 static int hook_ptrace(int request, int pid, void *addr, int data) {
-    if (request == 0x1F) return 0;   // PT_DENY_ATTACH
+    if (request == 0x1F) return 0;
     if (orig_ptrace) return orig_ptrace(request, pid, addr, data);
     return -1;
 }
@@ -306,7 +295,7 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 7. NSBundle swizzles — use cached gMainBundle, never call mainBundle
+// 7. NSBundle swizzles
 // ─────────────────────────────────────────────────────────────────────
 
 @interface NSBundle (RavenShield)
@@ -361,7 +350,8 @@ static void installNSBundleSwizzles(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Rebind table
+// Rebind table — NO add-image callback. All 18 symbols are already
+// loaded by the time our constructor fires.
 // ─────────────────────────────────────────────────────────────────────
 
 static struct rebinding gRebinds[] = {
@@ -385,26 +375,13 @@ static struct rebinding gRebinds[] = {
 static const int gRebindCount = sizeof(gRebinds) / sizeof(gRebinds[0]);
 
 // ─────────────────────────────────────────────────────────────────────
-// Add-image callback with re-entry guard
-// ─────────────────────────────────────────────────────────────────────
-
-static _Atomic BOOL gInAddImage = NO;
-
-static void raven_add_image(const struct mach_header *mh, intptr_t slide) {
-    (void)mh; (void)slide;
-    if (atomic_exchange(&gInAddImage, YES)) return;
-    rebind_symbols(gRebinds, gRebindCount);
-    atomic_store(&gInAddImage, NO);
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Deferred init — runs after UIApplicationDidFinishLaunching
+// Deferred init
 // ─────────────────────────────────────────────────────────────────────
 
 static void raven_deferred_init(void) {
+    if (atomic_exchange(&gDidInit, YES)) return;
     NSLog(@"[RavenShield] deferred init starting");
 
-    // Cache mainBundle ONCE — swizzles compare against this pointer
     gMainBundle = [NSBundle mainBundle];
     NSLog(@"[RavenShield] mainBundle cached: %@", gMainBundle);
 
@@ -414,8 +391,6 @@ static void raven_deferred_init(void) {
     installNSBundleSwizzles();
     NSLog(@"[RavenShield] NSBundle swizzles installed");
 
-    _dyld_register_func_for_add_image(raven_add_image);
-
     NSLog(@"[RavenShield] bypass active");
 }
 
@@ -423,21 +398,8 @@ __attribute__((constructor))
 static void raven_init(void) {
     NSLog(@"[RavenShield] constructor fired, deferring");
 
-    // Register for the first-run notification so UIKit is fully up
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:UIApplicationDidFinishLaunchingNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) {
-        raven_deferred_init();
-    }];
-
-    // Fallback — if CODM never posts the notification (Unity quirk),
-    // fire after 3 seconds anyway. Guard against double-init.
-    static _Atomic BOOL gDeferred = NO;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (atomic_exchange(&gDeferred, YES)) return;
         raven_deferred_init();
     });
 }
