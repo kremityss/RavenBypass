@@ -1,8 +1,8 @@
-Package: com.kremityss.ravenbypass
-Name: RavenBypass
+Package: com.kremityss.ravenshield
+Name: RavenShield
 Version: 1.0.0
 Architecture: iphoneos-arm64
-Description: RavenBypass iOS tweak project
-Maintainer: KremCheats
-Author: KremCheats
+Description: RavenSheild
+Maintainer: Raven
+Author: Raven
 Section: Tweaks
