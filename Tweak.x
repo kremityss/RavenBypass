@@ -10,6 +10,7 @@
 #import <objc/runtime.h>
 #import <string.h>
 #import <errno.h>
+#import <stdatomic.h>
 #import "fishhook.h"
 
 // Manual declarations — SDK headers for sysctl/ptrace conflict with Foundation
@@ -29,6 +30,12 @@ static const char *kKeychainWild  = "6KZFBJ4CBY.*";
 static const char *kAppGroup      = "group.com.activision.callofduty.shooter";
 static const char *kCertSubject   = "Apple Distribution: Activision Publishing, Inc. (6KZFBJ4CBY)";
 static const char *kAnoVersion    = "7.7.58.42114";
+
+// ─────────────────────────────────────────────────────────────────────
+// Cached mainBundle — used by NSBundle swizzles to avoid re-entrancy
+// ─────────────────────────────────────────────────────────────────────
+
+static NSBundle *gMainBundle = nil;
 
 // ─────────────────────────────────────────────────────────────────────
 // Hidden-image classifier
@@ -299,7 +306,7 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 7. NSBundle swizzles
+// 7. NSBundle swizzles — use cached gMainBundle, never call mainBundle
 // ─────────────────────────────────────────────────────────────────────
 
 @interface NSBundle (RavenShield)
@@ -311,12 +318,12 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 @implementation NSBundle (RavenShield)
 
 - (NSString *)raven_bundleIdentifier {
-    if (self == [NSBundle mainBundle]) return @(kBundleID);
+    if (gMainBundle && self == gMainBundle) return @(kBundleID);
     return [self raven_bundleIdentifier];
 }
 
 - (id)raven_objectForInfoDictionaryKey:(NSString *)key {
-    if (self == [NSBundle mainBundle]) {
+    if (gMainBundle && self == gMainBundle) {
         if ([key isEqualToString:@"CFBundleIdentifier"])     return @(kBundleID);
         if ([key isEqualToString:@"AppIdentifierPrefix"])    return @(kAppPrefix);
         if ([key isEqualToString:@"application-identifier"]) return @(kAppID);
@@ -327,7 +334,7 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 
 - (NSDictionary *)raven_infoDictionary {
     NSDictionary *orig = [self raven_infoDictionary];
-    if (self == [NSBundle mainBundle] && orig) {
+    if (gMainBundle && self == gMainBundle && orig) {
         NSMutableDictionary *m = [orig mutableCopy];
         m[@"CFBundleIdentifier"] = @(kBundleID);
         m[@"AppIdentifierPrefix"] = @(kAppPrefix);
@@ -377,27 +384,60 @@ static struct rebinding gRebinds[] = {
 };
 static const int gRebindCount = sizeof(gRebinds) / sizeof(gRebinds[0]);
 
-// Plain C function — required because _dyld_register_func_for_add_image
-// takes a function pointer, not a block.
+// ─────────────────────────────────────────────────────────────────────
+// Add-image callback with re-entry guard
+// ─────────────────────────────────────────────────────────────────────
+
+static _Atomic BOOL gInAddImage = NO;
+
 static void raven_add_image(const struct mach_header *mh, intptr_t slide) {
     (void)mh; (void)slide;
+    if (atomic_exchange(&gInAddImage, YES)) return;
     rebind_symbols(gRebinds, gRebindCount);
+    atomic_store(&gInAddImage, NO);
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Constructor
+// Deferred init — runs after UIApplicationDidFinishLaunching
 // ─────────────────────────────────────────────────────────────────────
 
-__attribute__((constructor(101)))
-static void raven_init(void) {
-    NSLog(@"[RavenShield] installing ANOGS/ACE bypass");
+static void raven_deferred_init(void) {
+    NSLog(@"[RavenShield] deferred init starting");
+
+    // Cache mainBundle ONCE — swizzles compare against this pointer
+    gMainBundle = [NSBundle mainBundle];
+    NSLog(@"[RavenShield] mainBundle cached: %@", gMainBundle);
 
     int ret = rebind_symbols(gRebinds, gRebindCount);
     NSLog(@"[RavenShield] rebind_symbols returned %d", ret);
 
     installNSBundleSwizzles();
+    NSLog(@"[RavenShield] NSBundle swizzles installed");
 
     _dyld_register_func_for_add_image(raven_add_image);
 
     NSLog(@"[RavenShield] bypass active");
+}
+
+__attribute__((constructor))
+static void raven_init(void) {
+    NSLog(@"[RavenShield] constructor fired, deferring");
+
+    // Register for the first-run notification so UIKit is fully up
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidFinishLaunchingNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        raven_deferred_init();
+    }];
+
+    // Fallback — if CODM never posts the notification (Unity quirk),
+    // fire after 3 seconds anyway. Guard against double-init.
+    static _Atomic BOOL gDeferred = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (atomic_exchange(&gDeferred, YES)) return;
+        raven_deferred_init();
+    });
 }
