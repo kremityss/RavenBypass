@@ -1,15 +1,37 @@
+// RavenBypass — ANOGS/ACE bypass for CODM
+// Reconstructed from the recovered Cloud bypass logic.
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <mach-o/dyld.h>
-#import <mach-o/getsect.h>
 #import <mach-o/loader.h>
 #import <dlfcn.h>
-#import <sys/sysctl.h>
-#import <sys/ptrace.h>
 #import <objc/runtime.h>
 #import <string.h>
+#import <errno.h>
 #import "fishhook.h"
+
+// ─────────────────────────────────────────────────────────────────────
+// Manual declarations — avoids <sys/sysctl.h>, <sys/ptrace.h>,
+// <mach-o/getsect.h>, and mismatched Security headers on newer SDKs.
+// ─────────────────────────────────────────────────────────────────────
+
+extern int sysctl(int *, unsigned int, void *, size_t *, void *, size_t);
+extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+extern int ptrace(int, int, void *, int);
+
+extern struct segment_command_64 *getsegbyname(const char *segname);
+extern void *getsegmentdata(const struct mach_header *mh,
+                            const char *segname,
+                            unsigned long *size);
+
+extern CFTypeRef SecTaskCopyValueForEntitlement(void *task,
+                                                CFStringRef entitlement,
+                                                CFErrorRef *error);
+extern OSStatus SecCodeCheckValidity(void *code, uint32_t flags, void *errors);
+extern OSStatus SecStaticCodeCheckValidity(void *code, uint32_t flags, void *errors);
+extern CFStringRef SecCertificateCopySubjectSummary(void *certificate);
 
 // ─────────────────────────────────────────────────────────────────────
 // Identity constants — make the game look like the official build
@@ -25,7 +47,7 @@ static const char *kCertSubject   = "Apple Distribution: Activision Publishing, 
 static const char *kAnoVersion    = "7.7.58.42114";
 
 // ─────────────────────────────────────────────────────────────────────
-// Hidden-image classifier — any image path containing these is hidden
+// Hidden-image classifier
 // ─────────────────────────────────────────────────────────────────────
 
 static const char *kHiddenNeedles[] = {
@@ -53,18 +75,6 @@ static const char *(*orig_dyld_get_image_name)(uint32_t);
 static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t);
 static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t);
 
-static uint32_t hook_dyld_image_count(void) {
-    if (!orig_dyld_image_count) return 0;
-    uint32_t n = orig_dyld_image_count();
-    if (!orig_dyld_get_image_name) return n;
-    uint32_t hidden = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (shouldHideImage(orig_dyld_get_image_name(i))) hidden++;
-    }
-    return n - hidden;
-}
-
-// Maps filtered index → real index, returns UINT32_MAX if out of range.
 static uint32_t filtered_to_real(uint32_t filtered) {
     if (!orig_dyld_image_count || !orig_dyld_get_image_name) return UINT32_MAX;
     uint32_t n = orig_dyld_image_count();
@@ -75,6 +85,17 @@ static uint32_t filtered_to_real(uint32_t filtered) {
         visible++;
     }
     return UINT32_MAX;
+}
+
+static uint32_t hook_dyld_image_count(void) {
+    if (!orig_dyld_image_count) return 0;
+    uint32_t n = orig_dyld_image_count();
+    if (!orig_dyld_get_image_name) return n;
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (shouldHideImage(orig_dyld_get_image_name(i))) hidden++;
+    }
+    return n - hidden;
 }
 
 static const char *hook_dyld_get_image_name(uint32_t idx) {
@@ -125,25 +146,25 @@ static int hook_dladdr(const void *addr, struct dl_info_s *info) {
 
 #define FAKE_LINKEDIT_SIZE 0x7ED160ULL
 
-typedef void *(*getsegbyname_fn)(const char *);
-typedef void *(*getsegmentdata_fn)(const void *, const char *, unsigned long *);
+typedef struct segment_command_64 *(*getsegbyname_fn)(const char *);
+typedef void *(*getsegmentdata_fn)(const struct mach_header *,
+                                    const char *, unsigned long *);
 
 static getsegbyname_fn orig_getsegbyname;
 static getsegmentdata_fn orig_getsegmentdata;
 
-static void *hook_getsegbyname(const char *seg) {
+static struct segment_command_64 *hook_getsegbyname(const char *seg) {
     if (!orig_getsegbyname) return NULL;
-    void *ret = orig_getsegbyname(seg);
+    struct segment_command_64 *ret = orig_getsegbyname(seg);
     if (ret && seg && strcmp(seg, "__LINKEDIT") == 0) {
-        // Mutate the returned segment command in place.
-        struct segment_command_64 *sc = (struct segment_command_64 *)ret;
-        sc->vmsize = FAKE_LINKEDIT_SIZE;
-        sc->filesize = FAKE_LINKEDIT_SIZE;
+        ret->vmsize = FAKE_LINKEDIT_SIZE;
+        ret->filesize = FAKE_LINKEDIT_SIZE;
     }
     return ret;
 }
 
-static void *hook_getsegmentdata(const void *mh, const char *seg,
+static void *hook_getsegmentdata(const struct mach_header *mh,
+                                  const char *seg,
                                   unsigned long *size) {
     if (!orig_getsegmentdata) return NULL;
     void *ret = orig_getsegmentdata(mh, seg, size);
@@ -154,7 +175,7 @@ static void *hook_getsegmentdata(const void *mh, const char *seg,
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 4. Entitlement / code-sign spoofing (Security.framework)
+// 4. Entitlement / code-sign spoofing
 // ─────────────────────────────────────────────────────────────────────
 
 typedef CFTypeRef (*SecTaskCopyValueForEntitlement_fn)(void *, CFStringRef, CFErrorRef *);
@@ -181,30 +202,32 @@ static CFArrayRef arr1(const char *a) {
     return CFArrayCreate(NULL, vals, 1, &kCFTypeArrayCallBacks);
 }
 
+static void cfStringToC(CFStringRef key, char *buf, size_t bufLen) {
+    if (!key || !buf || bufLen == 0) return;
+    if (!CFStringGetCString(key, buf, bufLen, kCFStringEncodingUTF8)) {
+        buf[0] = '\0';
+    }
+}
+
 static CFTypeRef hook_SecTaskCopyValueForEntitlement(void *task,
-                                                      CFStringRef key,
-                                                      CFErrorRef *err) {
-    if (key) {
-        const char *k = CFStringGetCStringPtr(key, kCFStringEncodingUTF8);
-        if (!k) {
-            char buf[256] = {0};
-            CFStringGetCString(key, buf, sizeof(buf), kCFStringEncodingUTF8);
-            k = buf;
-        }
-        if (k) {
-            if (strcmp(k, "application-identifier") == 0)
-                return cfstr(kAppID);
-            if (strcmp(k, "com.apple.developer.team-identifier") == 0)
-                return cfstr(kTeamID);
-            if (strcmp(k, "aps-environment") == 0)
-                return cfstr("production");
-            if (strcmp(k, "keychain-access-groups") == 0)
-                return arr2(kAppID, kKeychainWild);
-            if (strcmp(k, "com.apple.security.application-groups") == 0)
-                return arr1(kAppGroup);
-            if (strcmp(k, "get-task-allow") == 0)
-                return kCFBooleanFalse;
-        }
+                                                     CFStringRef key,
+                                                     CFErrorRef *err) {
+    char k[256] = {0};
+    cfStringToC(key, k, sizeof(k));
+
+    if (k[0]) {
+        if (strcmp(k, "application-identifier") == 0)
+            return cfstr(kAppID);
+        if (strcmp(k, "com.apple.developer.team-identifier") == 0)
+            return cfstr(kTeamID);
+        if (strcmp(k, "aps-environment") == 0)
+            return cfstr("production");
+        if (strcmp(k, "keychain-access-groups") == 0)
+            return arr2(kAppID, kKeychainWild);
+        if (strcmp(k, "com.apple.security.application-groups") == 0)
+            return arr1(kAppGroup);
+        if (strcmp(k, "get-task-allow") == 0)
+            return kCFBooleanFalse;
     }
     if (orig_SecTaskCopyValueForEntitlement)
         return orig_SecTaskCopyValueForEntitlement(task, key, err);
@@ -271,11 +294,11 @@ static char *hook_getenv(const char *name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 6. AnoSDKIoctl suppression — the direct ACE hook
+// 6. AnoSDKIoctl suppression
 // ─────────────────────────────────────────────────────────────────────
 
 #define ANO_BLOCKED_MASK 0x0002C6000E040002ULL
-// Bits set: 1, 18, 25, 26, 27, 41, 42, 46, 47, 49
+// Bits: 1, 18, 25, 26, 27, 41, 42, 46, 47, 49
 
 typedef uintptr_t (*AnoSDKIoctl_fn)(uint32_t, uintptr_t, void *, size_t);
 static AnoSDKIoctl_fn orig_AnoSDKIoctl;
@@ -298,6 +321,12 @@ static uintptr_t hook_AnoSDKIoctl(uint32_t req, uintptr_t a1,
 // ─────────────────────────────────────────────────────────────────────
 // 7. NSBundle identity swizzle
 // ─────────────────────────────────────────────────────────────────────
+
+@interface NSBundle (RavenBypass)
+- (NSString *)raven_bundleIdentifier;
+- (id)raven_objectForInfoDictionaryKey:(NSString *)key;
+- (NSDictionary *)raven_infoDictionary;
+@end
 
 @implementation NSBundle (RavenBypass)
 
@@ -345,15 +374,14 @@ static void installNSBundleSwizzles(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Constructor — install everything at load
+// Constructor
 // ─────────────────────────────────────────────────────────────────────
 
 __attribute__((constructor(101)))
 static void raven_init(void) {
     NSLog(@"[RavenBypass] installing ANOGS/ACE bypass");
 
-    // 1. fishhook rebindings
-    struct rebinding rb[] = {
+    static struct rebinding rb[] = {
         { "_dyld_image_count",              (void *)hook_dyld_image_count,              (void **)&orig_dyld_image_count },
         { "_dyld_get_image_name",           (void *)hook_dyld_get_image_name,           (void **)&orig_dyld_get_image_name },
         { "_dyld_get_image_header",         (void *)hook_dyld_get_image_header,         (void **)&orig_dyld_get_image_header },
@@ -375,12 +403,10 @@ static void raven_init(void) {
     int ret = rebind_symbols(rb, n);
     NSLog(@"[RavenBypass] rebind_symbols returned %d", ret);
 
-    // 2. NSBundle swizzles
     installNSBundleSwizzles();
 
-    // 3. Register add-image callback so future dylibs get filtered too
-    _dyld_register_func_for_add_image(^(const struct mach_header *mh, intptr_t slide) {
-        // Re-run rebinds against the newly-loaded image
+    _dyld_register_func_for_add_image(^(const struct mach_header *mh,
+                                         intptr_t slide) {
         rebind_symbols(rb, n);
     });
 
