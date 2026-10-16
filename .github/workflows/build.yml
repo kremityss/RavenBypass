@@ -1,4 +1,4 @@
-name: Build RavenBypass
+name: Build RavenShield
 
 on:
   push:
@@ -39,15 +39,15 @@ jobs:
 
       - name: Locate dylib
         run: |
-          DY=$(find . -name "RavenBypass.dylib" -type f | head -1)
+          DY=$(find . -name "RavenShield.dylib" -type f | head -1)
           echo "Found: $DY"
-          cp "$DY" ./RavenBypass.dylib
-          ls -la RavenBypass.dylib
-          file RavenBypass.dylib
+          cp "$DY" ./RavenShield.dylib
+          ls -la RavenShield.dylib
+          file RavenShield.dylib
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: RavenBypass-dylib
-          path: RavenBypass.dylib
+          name: RavenShield-dylib
+          path: RavenShield.dylib
           retention-days: 30
