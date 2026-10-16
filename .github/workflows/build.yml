@@ -1,0 +1,53 @@
+name: Build RavenBypass
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Install Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive --quiet https://github.com/theos/theos.git $THEOS
+          mkdir -p $THEOS/sdks
+          cd $THEOS/sdks
+          curl -sL -o master.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/* .
+          rm -rf master.zip sdks-master
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+      - name: Fetch fishhook
+        run: |
+          curl -sL -o fishhook.h https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h
+          curl -sL -o fishhook.c https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c
+
+      - name: Build tweak
+        run: |
+          make clean || true
+          make package FINALPACKAGE=1
+
+      - name: Locate dylib
+        run: |
+          DY=$(find . -name "RavenBypass.dylib" -type f | head -1)
+          echo "Found: $DY"
+          cp "$DY" ./RavenBypass.dylib
+          ls -la RavenBypass.dylib
+          file RavenBypass.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: RavenBypass-dylib
+          path: RavenBypass.dylib
+          retention-days: 30
